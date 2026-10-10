@@ -1,0 +1,75 @@
+name: Terraform Azure
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+          terraform_wrapper: false
+
+      - run: terraform init
+      - run: terraform fmt -check
+      - run: terraform validate
+      - run: terraform plan -input=false -var "image_tag=${{ github.sha }}"
+
+  apply:
+    name: Terraform Apply (après approbation)
+    needs: plan
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    # Point 15 : l'environnement "production" doit avoir des "Required reviewers"
+    # (Settings > Environments). Le job attend votre validation manuelle.
+    environment: production
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+          terraform_wrapper: false
+
+      - run: terraform init
+
+      # 1) Crée d'abord l'ACR (et ce dont il dépend)
+      - name: Apply ACR
+        run: terraform apply -input=false -auto-approve -target=azurerm_container_registry.acr
+
+      # 2) Build + push de l'image vers l'ACR
+      - uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Build and push image
+        run: |
+          ACR_NAME=$(terraform output -raw acr_name)
+          az acr login --name "$ACR_NAME"
+          docker build -t "$ACR_NAME.azurecr.io/cr460-web:${{ github.sha }}" ../app
+          docker push "$ACR_NAME.azurecr.io/cr460-web:${{ github.sha }}"
+
+      # 3) Déploiement complet (RG, VNet, VM, Key Vault, container)
+      - name: Apply complet
+        run: terraform apply -input=false -auto-approve -var "image_tag=${{ github.sha }}"
