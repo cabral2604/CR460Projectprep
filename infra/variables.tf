@@ -20,7 +20,7 @@ variable "environment" {
 variable "vm_size" {
   description = "Taille de la VM"
   type        = string
-  default     = "Standard_B1s"
+  default     = "Standard_DC1s_v3"
 }
 
 variable "allowed_ssh_cidr" {
