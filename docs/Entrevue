@@ -1,0 +1,77 @@
+# Préparation d'entrevue : pipeline CI/CD Azure avec Terraform
+
+Aide-mémoire pour présenter ce projet en entrevue (rôles : cloud, DevOps, DevSecOps, architecte).
+
+## Pitch de 30 secondes
+
+« J'ai construit un pipeline d'infrastructure as code : un push sur GitHub déclenche Terraform dans HCP Terraform, qui déploie sur Azure un réseau, une VM, un Key Vault, un registre de conteneurs et un conteneur Docker. Le mot de passe de la VM n'est jamais écrit en clair : Terraform le génère et le stocke dans Key Vault. Le déploiement passe par une approbation manuelle dans GitHub Actions entre le plan et l'apply. »
+
+## Ce que j'ai réellement fait
+
+- Écriture du code Terraform (réseau, VM, Key Vault, ACR, ACI), paramétré par des variables.
+- Création d'un service principal Azure à moindre périmètre (rôle Contributor sur un abonnement de test) et stockage de ses identifiants dans HCP Terraform comme variables d'environnement, dont le secret en *Sensitive*.
+- Mise en place du flux : GitHub → HCP Terraform → Azure, puis bascule vers un workflow GitHub Actions avec environnement protégé (*Required reviewers*).
+- Construction et publication d'une image Docker dans l'ACR avant le déploiement du conteneur.
+- Application d'un tag de coûts sur toutes les ressources.
+- Destruction complète des ressources et suppression du service principal et des tokens à la fin.
+
+## Décisions techniques et justification
+
+| Décision | Pourquoi |
+|---|---|
+| HCP Terraform pour l'état et l'exécution | État distant, verrouillé, versionné ; les identifiants Azure ne quittent pas le workspace |
+| Service principal en `Contributor` | Moindre privilège par rapport à `Owner` ; suffisant pour créer les ressources |
+| `count = var.image_tag == "" ? 0 : 1` sur le conteneur | Le conteneur ne peut pas démarrer tant que l'image n'est pas dans l'ACR : le déploiement se fait en deux temps, sans erreur |
+| Suffixe aléatoire sur les noms | Key Vault et ACR ont des noms uniques à l'échelle mondiale |
+| Environnement GitHub `production` avec réviseur | Contrôle humain avant toute modification de l'infrastructure |
+| Dépôt détaché du workspace pour l'étape d'approbation | Un workspace relié à VCS refuse les `apply` lancés par une API externe ; une seule source de déclenchement évite les doubles exécutions |
+
+## Problèmes rencontrés et résolution (format STAR court)
+
+1. **VM `Standard_B1s` indisponible (`SkuNotAvailable`).** J'ai listé les tailles disponibles avec `az vm list-skus`, constaté que les tailles économiques disponibles étaient ARM64, et choisi une taille x64 (`Standard_DC1s_v3`). Le changement tient en une ligne grâce à la variable `vm_size`, ce qui valide la paramétrisation.
+2. **`az acr build` bloqué sur le compte gratuit.** J'ai construit l'image avec Docker Desktop et fait le `docker push` vers l'ACR, sans changer le reste de la chaîne.
+3. **Workspace en mode VCS qui refuse l'apply de GitHub Actions.** J'ai compris la différence entre workspace piloté par VCS et piloté par CLI/API, et détaché le dépôt en conservant l'état.
+4. **Mot de passe du service principal exposé dans une capture.** Je l'ai réinitialisé immédiatement (`az ad sp credential reset`), exclu la capture du rapport, puis supprimé le service principal en fin de projet. J'applique ensuite la règle : aucun secret dans le code, les captures ou les messages.
+5. **Terraform en mauvaise architecture, MFA bloquant `az login`, PATH.** Diagnostic avec `where terraform`, `az login --tenant`, et réinstallation en amd64.
+
+## Limites connues (à mentionner honnêtement)
+
+- **Le secret se retrouve dans l'état Terraform.** Générer le mot de passe avec Terraform (`random_password`) le place dans le state, même s'il est aussi dans Key Vault. Le state est donc à protéger (HCP Terraform le chiffre et contrôle l'accès).
+- **SSH ouvert à `*` par défaut.** `allowed_ssh_cidr` existe pour le restreindre à une IP ; en production on utiliserait Azure Bastion ou une clé SSH sans mot de passe.
+- **Key Vault en politiques d'accès.** Le modèle actuel recommandé est RBAC.
+- **Registre avec compte admin.** Pour la production : identité managée et rôle `AcrPull` sur le conteneur.
+- **Identifiants Azure à longue durée de vie** (secret du service principal), ce qui est le point le plus faible du pipeline.
+
+## Améliorations possibles (prochaine version du projet)
+
+| Amélioration | Valeur démontrée |
+|---|---|
+| **OIDC / identifiants fédérés** entre GitHub Actions et Azure (plus de secret longue durée) | Sécurité des pipelines |
+| **Analyse de sécurité** dans le pipeline (`tfsec` ou `checkov`) et `tflint` | DevSecOps, shift-left |
+| **Authentification par clé SSH** + Bastion, mot de passe supprimé | Durcissement |
+| **Identité managée + AcrPull** pour le conteneur, Key Vault en RBAC | Moindre privilège |
+| **Modules Terraform** (réseau, calcul, registre) et environnements `dev` / `prod` | Réutilisabilité |
+| **Estimation des coûts** (Infracost) dans la pull request | FinOps |
+| **Plan commenté sur les pull requests** et protection de la branche `main` | Revue de code |
+| **Workflow de destruction** manuel et contrôlé | Gestion du cycle de vie |
+| **Version AWS équivalente** (cohérente avec ma certification Solutions Architect) | Multi-cloud |
+
+## Questions probables et pistes de réponse
+
+- **Pourquoi Terraform plutôt qu'ARM/Bicep ?** Multi-cloud, écosystème, état explicite et plan lisible avant modification.
+- **Que contient l'état Terraform et comment le protégez-vous ?** Il décrit les ressources et peut contenir des secrets ; il est stocké à distance, chiffré, avec contrôle d'accès et verrouillage dans HCP Terraform.
+- **Comment gérez-vous les secrets ?** Key Vault pour les valeurs applicatives, variables *Sensitive* pour les identifiants du pipeline, aucun secret dans Git ; piste : OIDC pour supprimer le secret du service principal.
+- **Comment éviter qu'un changement dangereux soit appliqué ?** Plan relu, approbation humaine par environnement protégé, protection de branche.
+- **Que se passe-t-il si deux personnes poussent en même temps ?** Verrouillage de l'état : une seule exécution modifie l'infrastructure à la fois.
+- **Comment gérez-vous les coûts ?** Tag de coûts sur toutes les ressources, tailles adaptées, destruction après usage, estimation de coûts en perspective.
+- **Comment passeriez-vous à plusieurs environnements ?** Modules, un workspace par environnement, variables par environnement, approbations différenciées.
+
+## Démonstration (3 minutes)
+
+1. Montrer l'architecture (diagramme du README).
+2. Modifier une variable (par exemple `environment`) et pousser.
+3. Montrer le plan, puis l'attente d'approbation (*Review deployments*).
+4. Approuver, montrer l'apply et l'output `container_url`.
+5. Conclure sur les limites et les améliorations prévues.
+
+> L'infrastructure est déjà détruite côté Azure ; pour une démonstration en direct, suivre `docs/GUIDE.md` (environ 1 h pour redéployer) ou préparer des captures et une courte vidéo.

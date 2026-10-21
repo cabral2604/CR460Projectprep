@@ -1,0 +1,244 @@
+# Guide pas à pas : refaire le projet de A à Z
+
+Ce guide permet à une personne qui découvre le sujet de reconstruire le projet complet : GitHub → HCP Terraform → Azure, avec Docker et une approbation manuelle. Les commandes sont pour **Windows / PowerShell**. Durée estimée : 2 à 3 heures.
+
+Remplacez les valeurs entre `< >` par les vôtres.
+
+---
+
+## Étape 0 : Préparer les comptes et les outils
+
+**Comptes à créer (gratuits) :**
+- GitHub : https://github.com
+- HCP Terraform (Terraform Cloud) : https://app.terraform.io (connexion avec GitHub possible)
+- Microsoft Azure, compte gratuit avec crédit : https://azure.microsoft.com/free (carte bancaire demandée pour la vérification)
+
+**Outils à installer :**
+| Outil | Installation | Vérification |
+|---|---|---|
+| VS Code | https://code.visualstudio.com | ouvrir l'application |
+| Git | `winget install Git.Git` | `git --version` |
+| Terraform CLI (**amd64**) | https://developer.hashicorp.com/terraform/install | `terraform version` |
+| Azure CLI | `winget install -e --id Microsoft.AzureCLI` | `az version` |
+| Docker Desktop | https://www.docker.com/products/docker-desktop | `docker version` |
+
+Après chaque installation, **fermez et rouvrez le terminal** pour que le PATH soit mis à jour.
+
+Extensions VS Code utiles : *HashiCorp Terraform*, *GitHub Pull Requests*, *Azure Tools*.
+
+> Piège fréquent : sur Windows, choisir la version **amd64** de Terraform (pas ARM64), sinon `terraform` ne démarre pas.
+
+---
+
+## Étape 1 : Créer le dépôt GitHub et cloner
+
+1. Sur GitHub : *New repository*, nom `CR460Projectprep` (ou le vôtre), public.
+2. Dans PowerShell :
+```powershell
+cd $HOME\Documents
+git clone https://github.com/<votre-compte>/CR460Projectprep.git
+cd CR460Projectprep
+git config --global user.name "<Votre nom>"
+git config --global user.email "<votre courriel>"
+```
+3. Créez cette arborescence : `infra/` (main.tf, variables.tf, outputs.tf), `app/` (Dockerfile, index.html), `.github/workflows/terraform.yml`.
+
+Fichiers de l'application :
+```dockerfile
+# app/Dockerfile
+FROM nginx:alpine
+COPY index.html /usr/share/nginx/html/index.html
+EXPOSE 80
+```
+`app/index.html` : une page HTML simple avec un titre.
+
+Ajoutez un `.gitignore` contenant au moins : `.terraform/`, `*.tfstate*`, `*.tfvars`.
+
+---
+
+## Étape 2 : Se connecter à Azure et créer le service principal
+
+Un **service principal** est un « compte robot » qui permet à Terraform Cloud d'agir sur Azure.
+
+```powershell
+az login --tenant <ID-du-tenant>      # --tenant évite l'erreur MFA (AADSTS50076)
+az account show                        # note l'ID de l'abonnement (id) et du tenant (tenantId)
+
+# Enregistrer les services Azure utilisés
+az provider register --namespace Microsoft.KeyVault --wait
+az provider register --namespace Microsoft.ContainerRegistry --wait
+az provider register --namespace Microsoft.ContainerInstance --wait
+
+# Créer le service principal (rôle Contributor sur l'abonnement)
+az ad sp create-for-rbac --name sp-cr460 --role Contributor --scopes /subscriptions/<ID-abonnement>
+```
+
+La commande affiche quatre valeurs : `appId` (ARM_CLIENT_ID), `password` (ARM_CLIENT_SECRET), `tenant` (ARM_TENANT_ID), et vous avez déjà l'ID d'abonnement (ARM_SUBSCRIPTION_ID).
+
+> **Le mot de passe ne s'affiche qu'une fois.** Copiez-le tout de suite dans un endroit sûr. Ne le mettez **jamais** dans le code, dans une capture d'écran ni dans un message. Si vous l'avez exposé : `az ad sp credential reset --id <appId>`.
+
+---
+
+## Étape 3 : Créer l'organisation et le workspace HCP Terraform
+
+1. Sur https://app.terraform.io, créez une **organisation** (par exemple `CR460-infonuagique_<nom>`).
+2. *New → Workspace → Version control workflow* : choisissez GitHub, autorisez l'accès, sélectionnez votre dépôt.
+3. Nommez le workspace (par exemple `My_workspace_Devoir-Infonuagique`).
+4. Dans *Settings → General* du workspace, mettez **Terraform Working Directory** = `infra`. Exécution : *Remote*.
+5. Dans *Variables*, ajoutez **quatre variables d'environnement** (catégorie *Environment variables*, pas *Terraform variables*) :
+
+| Clé | Valeur | Sensitive |
+|---|---|---|
+| `ARM_CLIENT_ID` | appId | non |
+| `ARM_CLIENT_SECRET` | password | **oui** |
+| `ARM_SUBSCRIPTION_ID` | ID de l'abonnement | non |
+| `ARM_TENANT_ID` | ID du tenant | non |
+
+6. Sur votre poste : `terraform login` (ouvre le navigateur pour générer un token) : permet à la CLI de parler à HCP Terraform.
+
+---
+
+## Étape 4 : Écrire le code Terraform
+
+Dans `infra/main.tf`, commencez par le bloc qui relie le code au workspace :
+```hcl
+terraform {
+  required_version = ">= 1.5.0"
+  cloud {
+    organization = "<votre-organisation>"
+    workspaces { name = "<votre-workspace>" }
+  }
+  required_providers {
+    azurerm = { source = "hashicorp/azurerm", version = "~> 4.0" }
+    random  = { source = "hashicorp/random",  version = "~> 3.6" }
+  }
+}
+provider "azurerm" { features {} }
+```
+
+Puis ajoutez les ressources **dans cet ordre** (le dépôt du projet contient le code complet) :
+
+| # | Ressource Terraform | Rôle |
+|---|---|---|
+| 1 | `azurerm_resource_group` | Groupe de ressources |
+| 2 | `azurerm_virtual_network`, `azurerm_subnet`, `azurerm_network_security_group` | Réseau |
+| 3 | `random_string`, `random_password`, `azurerm_key_vault`, `azurerm_key_vault_secret` | Mot de passe dans le Key Vault |
+| 4 | `azurerm_public_ip`, `azurerm_network_interface`, `azurerm_linux_virtual_machine` | VM (mot de passe lu depuis le secret) |
+| 5 | `azurerm_container_registry` (admin activé) | Registre d'images |
+| 6 | `azurerm_container_group` avec `count = var.image_tag == "" ? 0 : 1` | Conteneur, créé seulement quand l'image existe |
+
+Trois règles qui évitent des erreurs :
+- **Variables** (`variables.tf`) : région, préfixe, environnement, taille de VM, `image_tag`. Aucune valeur en dur dans `main.tf`.
+- **Tag de coûts** : `locals { tags = { Projet = "DevoirCR460" } }` puis `tags = local.tags` sur **chaque** ressource.
+- **Noms globaux** (Key Vault, ACR) : ajoutez le suffixe aléatoire, sinon le nom est déjà pris.
+
+Validez en local :
+```powershell
+cd infra
+terraform init
+terraform fmt
+terraform validate
+```
+
+---
+
+## Étape 5 : Premier déploiement (sans le conteneur)
+
+```powershell
+cd ..
+git add .
+git commit -m "Infrastructure Terraform"
+git push
+```
+Dans HCP Terraform, le workspace lance un **plan** automatiquement. Lisez-le (nombre de ressources à créer), puis cliquez sur **Confirm & Apply**.
+
+Vérification : dans le portail Azure (https://portal.azure.com), le groupe `rg-cr460-dev` contient les ressources.
+
+**Si l'apply échoue avec `SkuNotAvailable`** : la taille de VM n'est pas disponible dans la région pour votre abonnement. Cherchez une taille disponible :
+```powershell
+az vm list-skus --location canadacentral --resource-type virtualMachines --size Standard_D -o table
+```
+Choisissez une taille **x64** (pas ARM64) et modifiez `vm_size` dans `variables.tf`, puis `git push`. Ce projet a utilisé `Standard_DC1s_v3`.
+
+---
+
+## Étape 6 : Construire et publier l'image Docker
+
+Docker Desktop doit être démarré.
+
+```powershell
+cd app
+az acr login --name <nom-de-l-acr>                      # nom visible dans la sortie "acr_name"
+docker build -t <acr>.azurecr.io/cr460-web:v1 .
+docker push <acr>.azurecr.io/cr460-web:v1
+```
+Vérification : portail Azure → l'ACR → *Repositories* → `cr460-web` avec le tag `v1`.
+
+> `az acr build` (construction dans Azure) est bloqué sur certains comptes gratuits (`TasksOperationsNotAllowed`) : c'est pourquoi on construit en local avec Docker.
+
+---
+
+## Étape 7 : Déployer le conteneur
+
+1. HCP Terraform → workspace → *Variables* → **Terraform variable** (pas Environment) : `image_tag` = `v1`.
+2. *Actions → Start new run* → Plan, puis **Confirm & Apply**.
+3. L'output `container_url` donne l'adresse. Ouvrez-la dans le navigateur : la page de `index.html` s'affiche.
+
+---
+
+## Étape 8 : Consulter le secret du Key Vault
+
+Terraform donne l'accès au service principal seulement. Pour voir le secret dans le portail, ajoutez votre compte :
+```powershell
+az keyvault set-policy --name <nom-du-keyvault> --upn <votre-courriel> --secret-permissions get list
+az keyvault secret list --vault-name <nom-du-keyvault> -o table
+```
+Ne pas afficher la **valeur** du secret dans une capture.
+
+---
+
+## Étape 9 : Ajouter l'approbation manuelle avec GitHub Actions
+
+**Principe :** deux jobs. Le premier fait le `plan`. Le second fait l'`apply` et utilise un environnement GitHub protégé : il attend qu'un réviseur approuve.
+
+1. **Workflow** : `.github/workflows/terraform.yml` avec les jobs `plan` et `apply` (`needs: plan`, `environment: production`).
+2. **Détacher le dépôt du workspace** : HCP Terraform → workspace → *Settings → Version Control* → *Disconnect*. Un workspace relié à un dépôt refuse les `apply` lancés de l'extérieur. L'état et les ressources sont conservés.
+3. **Token d'API** : HCP Terraform → icône du profil → *Account settings → Tokens → Create an API token*. Copiez-le.
+4. **Secret GitHub** : dépôt → *Settings → Secrets and variables → Actions → New repository secret* : nom `TF_API_TOKEN`, valeur = le token.
+5. **Environnement** : dépôt → *Settings → Environments → New environment* : `production` → cochez **Required reviewers** → ajoutez votre compte → *Save protection rules*. Laissez « Prevent self-review » décoché si vous êtes seul.
+6. `git push` du workflow, puis onglet **Actions** : le plan passe, l'apply attend. Cliquez sur **Review deployments → production → Approve and deploy**.
+
+---
+
+## Étape 10 : Détruire et nettoyer (important)
+
+Sans nettoyage, la VM et le registre consomment votre crédit.
+
+1. HCP Terraform → workspace → *Settings → Destruction and deletion → Queue destroy plan* → confirmer, puis **Confirm & Apply** (« 14 destroyed »).
+2. Vérifier : `az group list -o table`. `rg-cr460-dev` ne doit plus apparaître (`NetworkWatcherRG` est normal et gratuit).
+3. Supprimer le service principal : `az ad sp delete --id <appId>`.
+4. Supprimer le token HCP Terraform et le secret `TF_API_TOKEN`.
+
+---
+
+## Problèmes fréquents
+
+| Symptôme | Cause | Solution |
+|---|---|---|
+| `terraform` ne démarre pas ou version bizarre | Mauvaise architecture, ou ancien exécutable devant dans le PATH | Télécharger amd64 ; `where terraform` |
+| `git` ou `az` « n'est pas reconnu » | PATH non mis à jour | Fermer et rouvrir le terminal |
+| `AADSTS50076` à `az login` | MFA exigée par le tenant | `az login --tenant <ID>` |
+| `SkuNotAvailable` | Taille de VM non disponible | Changer `vm_size` (x64) |
+| `--query` avec accents graves échoue dans PowerShell | Le backtick est un caractère d'échappement | Utiliser des guillemets simples ou `ConvertFrom-Json` |
+| Key Vault « List not enabled » dans le portail | Votre compte n'a pas de politique d'accès | Étape 8 |
+| `az acr build` : `TasksOperationsNotAllowed` | Fonction bloquée sur le compte gratuit | Construire avec Docker Desktop (étape 6) |
+| Docker Desktop ne démarre pas (virtualisation) | Virtualisation désactivée | Activer la virtualisation dans le BIOS, puis WSL 2 |
+| GitHub Actions : `Required token could not be found` | Secret `TF_API_TOKEN` absent | Étape 9, points 3 et 4 |
+| Apply de GitHub Actions refusé | Workspace encore relié au dépôt | Étape 9, point 2 |
+
+---
+
+## Captures utiles (si le projet est un devoir)
+
+Pour chaque étape, gardez une capture : installation de VS Code et des extensions, compte GitHub, `terraform version`, workspace HCP Terraform, abonnement Azure, variables du workspace (secret masqué), plan et apply, ressources dans le portail Azure, build et push Docker, conteneur en ligne, Key Vault, tags, approbation manuelle et apply final, destruction.
+**Jamais** de mot de passe, de token ni de secret visibles.
